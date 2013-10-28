@@ -57,6 +57,16 @@ const char version_minor = 4;
 #include <SFE_BMP085.h> // BMP085 pressure sensor library
 #include <Wire.h> // I2C library (necessary for pressure sensor)
 #include <avr/eeprom.h> // extended EEPROM read/write functions
+#include <String.h> // helper to manipulate strings
+
+
+#define GECKOBOARD_APIKEY                   "API_KEY"
+#define GECKOBOARD_HOST                     "push.geckoboard.com"
+#define GECKOBOARD_URL_WINDPRESSURE         "/v1/send/WIDGET_KEY"
+#define GECKOBOARD_URL_LIGHT                "/v1/send/WIDGET_KEY"
+#define GECKOBOARD_URL_TEMPERATUREHUMIDITY  "/v1/send/WIDGET_KEY"
+#define GECKOBOARD_URL_RAINFALL             "/v1/send/WIDGET_KEY"
+
 
 // digital I/O pins
 // (the following three are predefined)
@@ -113,6 +123,7 @@ SFE_BMP085 pressure_sensor(BMP_ADDR);
 const int CSV = 1; // default NMEA-like comma-separated values
 const int ANSI = 2; // ANSI-formatted data with hardware testing
 const int LCD = 3; // directly drive a SparkFun serial-enabled 16x2 LCD display
+const int GECKOBOARD = 4;
 
 // general units
 const int ENGLISH = 1; // wind speed in miles per hour, rain in inches, temperature in degrees Fahrenheit
@@ -128,12 +139,12 @@ const int ABSOLUTE = 1; // absolute (true) pressure, changes with altitude (igno
 const int RELATIVE = 2; // relative (weather) pressure, altitude effects removed (use altitude variable)
 
 // defaults, replaced with EEPROM settings if saved
-int data_format = ANSI;
-int general_units = ENGLISH;
-unsigned long sample_rate = 2; // sample rate (seconds per sample, 0 for as fast as possible)
+int data_format = GECKOBOARD;
+int general_units = SI;
+unsigned long sample_rate = 30; // sample rate (seconds per sample, 0 for as fast as possible)
 int pressure_type = RELATIVE;
 long altitude = 1596; // fixed weather station altitude in meters, for relative (sea level) pressure measurement
-int pressure_units = INHG;
+int pressure_units = MBAR;
 boolean weather_meters_attached = true; // true if we've hooked up SparkFun's Weather Meters (SEN-08942) (set to false to remove weather meters data from output)
 long baud_rate = 9600; // default baud rate
 
@@ -738,6 +749,29 @@ void loop()
         LCDstate = 0;
       break;
     }
+
+    case GECKOBOARD: // this data_format will send data through HTTP requests to geckoboard cloud dashboard service (http://geckoboard.com)
+    {
+      sendLightData(TEMT6000_light);
+      
+      if (weather_meters_attached) {
+        delay(500); // wait to send data through Serial
+        sendRainfallData(WM_rainfall);
+        
+        delay(500); // wait to send data through Serial
+        sendWindPressureData(WM_wspeed, WM_wdirection, BMP085_pressure);
+
+      } else {
+        delay(500); // wait to send data through Serial
+        sendWindPressureData(-1.0, -1.0, BMP085_pressure); // pressure could be reported
+
+      }
+
+      delay(500); // wait to send data through Serial
+      sendTemperatureHumidityData(SHT15_temp, SHT15_humidity);
+      
+      break;
+    }
   }
 
   // turn off LED (done with measurements)
@@ -836,6 +870,7 @@ void menu()
       case CSV: Serial.print(F("CSV")); break;
       case ANSI: Serial.print(F("ANSI")); break;
       case LCD: Serial.print(F("LCD")); break;
+      case GECKOBOARD: Serial.print(F("GECKOBOARD")); break;
     }
     Serial.println(F(")"));
 
@@ -900,6 +935,7 @@ void menu()
         Serial.println(F("1. CSV"));
         Serial.println(F("2. ANSI"));
         Serial.println(F("3. LCD"));
+        Serial.println(F("4. GECKOBOARD"));
         Serial.println();
         data_format = getSingleChar() - '0';
         break;
@@ -1079,12 +1115,12 @@ char getSingleChar()
 
 void resetDefaults()
 {
-  data_format = ANSI;
-  general_units = ENGLISH;
-  sample_rate = 2; // sample rate (seconds per sample, 0 for as fast as possible)
+  data_format = GECKOBOARD;
+  general_units = SI;
+  sample_rate = 30; // sample rate (seconds per sample, 0 for as fast as possible)
   pressure_type = RELATIVE;
   altitude = 1596; // fixed weather station altitude in meters, for relative (sea level) pressure measurement
-  pressure_units = INHG;
+  pressure_units = MBAR;
   weather_meters_attached = true; // true if we've hooked up SparkFun's Weather Meters (SEN-08942) (set to false to remove weather meters data from output)
   baud_rate = 9600; // default baud rate
 }
@@ -1212,4 +1248,85 @@ void printComma() // we do this a lot, it saves two bytes each time we call it
 {
   Serial.print(F(","));
 }
+
+
+
+
+///////////////////////////////////////////////////////////
+////////////// H T T P   C O N N E C T I O N //////////////
+///////////////////////////////////////////////////////////
+
+char charBufTemp[10]; // to help in float and double conversions
+
+void makePostRequest (HardwareSerial mySerial, char* host, char* url, String postData) {
+  String httpMessage;
+
+  mySerial.print('\0');   // INIT MESSAGE
+
+  httpMessage = "POST " + String(url) + " HTTP/1.1\r\n";
+  httpMessage += "Host: " + String(host) + "\r\n"; 
+  httpMessage += "User-Agent: Arduino/1.0\r\n";
+  httpMessage += "Connection: close\r\n";
+  httpMessage += "Content-Length: " + String(postData.length()) + "\r\n";
+  httpMessage += "\r\n";
+  httpMessage += postData;
+
+  mySerial.print(httpMessage);
+  mySerial.print('\0');   // END MESSAGE
+}
+
+
+
+void sendWindPressureData (float windSpeedValue, float windDirectionValue, double pressureValue) {
+  String postData;
+
+  postData = "{ \"api_key\": \"" + String(GECKOBOARD_APIKEY) + "\", \"data\": [ ";
+  dtostrf(windSpeedValue, 1, 1, charBufTemp);
+  postData += "{ \"title\": { \"text\": \"Wind: " + String(charBufTemp) + " m/s\", \"highlight\": true }, \"description\": ";
+  dtostrf(windDirectionValue, 1, 0, charBufTemp);
+  postData += "\"direction: " + String(charBufTemp) + "º\" }, ";
+  dtostrf(pressureValue, 1, 2, charBufTemp);
+  postData += "{ \"title\": { \"text\": \"" + String(charBufTemp) + " mbar\", \"highlight\": true }, \"description\": \"Pressure\" } ";
+  postData += "] }";
+
+  makePostRequest(Serial, GECKOBOARD_HOST, GECKOBOARD_URL_WINDPRESSURE, postData);
+}
+
+void sendLightData (float lightValue) {
+  String postData;
+
+  postData = "{ \"api_key\": \"" + String(GECKOBOARD_APIKEY) + "\", \"data\": ";
+  dtostrf(lightValue, 1, 1, charBufTemp);
+  postData += "{ \"item\" : \"" + String(charBufTemp) + "\", \"min\" : { \"text\" : \"Min\", \"value\" : \"0\" }, \"max\" : { \"text\" : \"Max\", \"value\" : \"100\" } } ";
+  postData += "}";
+
+  makePostRequest(Serial, GECKOBOARD_HOST, GECKOBOARD_URL_LIGHT, postData);  
+}
+
+void sendRainfallData (float rainfallValue) {
+  String postData;
+
+  postData = "{ \"api_key\": \"" + String(GECKOBOARD_APIKEY) + "\", \"data\": ";
+  dtostrf(rainfallValue, 1, 1, charBufTemp);
+  postData += "{ \"orientation\": \"horizontal\", \"item\": { \"label\": \"Last Hour (-- mm)\", \"sublabel\": \"(mm)\", \"axis\": { \"point\": [ \"0\", \"10\", \"20\", \"30\", \"40\", \"50\" ] }, \"range\":[ { \"color\": \"green\", \"start\": 0, \"end\": 2.5 }, { \"color\": \"amber\", \"start\": 2.6, \"end\": 10 }, { \"color\": \"red\", \"start\": 11, \"end\": 50 } ], \"measure\": { \"current\": { \"start\": \"0\", \"end\": \"" + String(charBufTemp) + "\" }, \"projected\": { \"start\": \"0\", \"end\": \"0\" } } } } ";
+  postData += "}";
+
+  makePostRequest(Serial, GECKOBOARD_HOST, GECKOBOARD_URL_RAINFALL, postData);
+}
+
+void sendTemperatureHumidityData (float temperatureValue, float humidityValue) {
+  String postData;
+
+  postData = "{ \"api_key\": \"" + String(GECKOBOARD_APIKEY) + "\", \"data\": ";
+  postData += "{ \"highchart\": { \"chart\": { \"renderTo\": \"container\", \"plotBackgroundColor\": \"rgba(35,37,38,0)\", \"backgroundColor\": \"rgba(35,37,38,0)\", \"borderColor\": \"rgba(35,37,38,0)\", \"lineColor\": \"rgba(35,37,38,0)\", \"plotBorderColor\": \"rgba(35,37,38,0)\", \"plotBorderWidth\": null, \"plotShadow\": false, \"zoomType\": \"xy\"}, \"title\": { \"text\": null },\"credits\": { \"enabled\": false }, \"xAxis\": [{\"categories\": [\"-11h\", \"-10h\", \"-9h\", \"-8h\", \"-7h\", \"-6h\", \"-5h\", \"-4h\", \"-3h\", \"-2h\", \"-1h\", \"now\"],\"labels\": {\"y\": 20,\"rotation\": -45},\"tickmarkPlacement\": \"on\",\"tickLength\": 3}],\"yAxis\": [{ \"labels\": {\"format\": \"{value}\",\"style\": {\"color\": \"#89A54E\"}},\"title\": {\"text\": \"Temperature (°C)\",\"style\": {\"color\": \"#89A54E\"}}}, { \"title\": {\"text\": \"Humidity (%)\",\"style\": {\"color\": \"#4572A7\"}},\"labels\": {\"format\": \"{value}\",\"style\": {\"color\": \"#4572A7\"}},\"opposite\": true}],\"tooltip\": {\"shared\": true,\"backgroundColor\": {\"linearGradient\": { \"x1\": 0, \"y1\": 0, \"x2\": 0, \"y2\": 1 },\"stops\": [[0, \"rgba(96, 96, 96, .8)\"],[1, \"rgba(16, 16, 16, .8)\"]]},\"borderWidth\": 0,\"style\": {\"color\": \"#FFF\"}},\"legend\": {\"enabled\": false},\"series\": [";
+  dtostrf(temperatureValue, 1, 1, charBufTemp);
+  postData += "{\"name\": \"Temperature\",\"color\": \"#89A54E\",\"type\": \"spline\",\"data\": [\"\", \"\", \"\", \"\", \"\", \"\", \"\", \"\", \"\", \"\", \"\", " + String(charBufTemp) + "],\"tooltip\": {\"valueSuffix\": \" °C\"}},";
+  dtostrf(humidityValue, 1, 1, charBufTemp);
+  postData += "{\"name\": \"Humidity\",\"color\": \"#4572A7\",\"type\": \"spline\",\"yAxis\": 1,\"data\": [\"\", \"\", \"\", \"\", \"\", \"\", \"\", \"\", \"\", \"\", \"\", " + String(charBufTemp) + "],\"tooltip\": {\"valueSuffix\": \" %\"}}";
+  postData += "]}}";
+  postData += "}";
+
+  makePostRequest(Serial, GECKOBOARD_HOST, GECKOBOARD_URL_TEMPERATUREHUMIDITY, postData);
+}
+
 
