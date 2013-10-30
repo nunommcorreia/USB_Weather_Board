@@ -57,10 +57,11 @@ const char version_minor = 4;
 #include <SFE_BMP085.h> // BMP085 pressure sensor library
 #include <Wire.h> // I2C library (necessary for pressure sensor)
 #include <avr/eeprom.h> // extended EEPROM read/write functions
-#include <String.h> // helper to manipulate strings
 
 
 #define GECKOBOARD_APIKEY                   "API_KEY"
+#define METRICS_HISTORY_SIZE  12
+
 #define GECKOBOARD_HOST                     "push.geckoboard.com"
 #define GECKOBOARD_URL_WINDPRESSURE         "/v1/send/WIDGET_KEY"
 #define GECKOBOARD_URL_LIGHT                "/v1/send/WIDGET_KEY"
@@ -104,6 +105,11 @@ volatile unsigned long tempwindRPM, windtime, windlast, windinterval;
 volatile unsigned char windintcount;
 volatile boolean gotwspeed;
 volatile unsigned long raintime, rainlast, raininterval, rain;
+
+// history values
+unsigned int lastHourUpdate = 0;
+float SHT15_temp_history[METRICS_HISTORY_SIZE];
+float SHT15_humidity_history[METRICS_HISTORY_SIZE];
 
 // constant conversion factors
 const int BATT_RATIO = 63.3271; // divide ADC from BATT_LVL by this to get volts
@@ -752,6 +758,27 @@ void loop()
 
     case GECKOBOARD: // this data_format will send data through HTTP requests to geckoboard cloud dashboard service (http://geckoboard.com)
     {
+
+      // update history arrays
+      int currentHour = (int)(millis() / 1000) / 3600; // every hour
+      if (currentHour != lastHourUpdate) {
+        // update needed!
+        lastHourUpdate = currentHour;
+        // shift array one position to the right (the last index has the oldest value)
+        for(int i = (METRICS_HISTORY_SIZE - 1); i > 0; i--) { 
+          SHT15_temp_history[i] = SHT15_temp_history[i-1];
+          SHT15_humidity_history[i] = SHT15_humidity_history[i-1];
+        }
+        SHT15_temp_history[0] = 0;
+        SHT15_humidity_history[0] = 0;
+      }
+
+      // update current hour, always with the max value
+      SHT15_temp_history[0] = max(SHT15_temp_history[0], SHT15_temp);
+      SHT15_humidity_history[0] = max(SHT15_humidity_history[0], SHT15_humidity);
+
+
+      // send data
       sendLightData(TEMT6000_light);
       
       if (weather_meters_attached) {
@@ -768,7 +795,7 @@ void loop()
       }
 
       delay(500); // wait to send data through Serial
-      sendTemperatureHumidityData(SHT15_temp, SHT15_humidity);
+      sendTemperatureHumidityData(SHT15_temp, SHT15_temp_history, SHT15_humidity, SHT15_humidity_history);
       
       break;
     }
@@ -1256,77 +1283,126 @@ void printComma() // we do this a lot, it saves two bytes each time we call it
 ////////////// H T T P   C O N N E C T I O N //////////////
 ///////////////////////////////////////////////////////////
 
-char charBufTemp[10]; // to help in float and double conversions
+char charBufTemp1[10]; // to help in float and double conversions
+char charBufTemp2[10]; 
+char charBufTemp3[10]; 
 
-void makePostRequest (HardwareSerial mySerial, char* host, char* url, String postData) {
-  String httpMessage;
+void makePostRequest (HardwareSerial mySerial, char* host, char* url, char* postData) {
 
-  mySerial.print('\0');   // INIT MESSAGE
+  mySerial.write('\0');   // INIT MESSAGE
 
-  httpMessage = "POST " + String(url) + " HTTP/1.1\r\n";
-  httpMessage += "Host: " + String(host) + "\r\n"; 
-  httpMessage += "User-Agent: Arduino/1.0\r\n";
-  httpMessage += "Connection: close\r\n";
-  httpMessage += "Content-Length: " + String(postData.length()) + "\r\n";
-  httpMessage += "\r\n";
-  httpMessage += postData;
+  mySerial.print(F("POST ")); mySerial.write(url); mySerial.print(F(" HTTP/1.1\r\n"));
+  mySerial.print(F("Host: ")); mySerial.write(host); mySerial.print(F("\r\n"));
+  mySerial.print(F("User-Agent: Arduino/1.0\r\n"));
+  mySerial.print(F("Connection: close\r\n"));
+  mySerial.print(F("Content-Length: ")); mySerial.print(strlen(postData)); mySerial.print(F("\r\n"));
+  mySerial.print(F("\r\n"));
+  mySerial.write(postData); 
+  mySerial.flush();
 
-  mySerial.print(httpMessage);
-  mySerial.print('\0');   // END MESSAGE
+  mySerial.write('\0');   // END MESSAGE
+  mySerial.flush();
 }
 
 
 
 void sendWindPressureData (float windSpeedValue, float windDirectionValue, double pressureValue) {
-  String postData;
+  char postData[250];
 
-  postData = "{ \"api_key\": \"" + String(GECKOBOARD_APIKEY) + "\", \"data\": [ ";
-  dtostrf(windSpeedValue, 1, 1, charBufTemp);
-  postData += "{ \"title\": { \"text\": \"Wind: " + String(charBufTemp) + " m/s\", \"highlight\": true }, \"description\": ";
-  dtostrf(windDirectionValue, 1, 0, charBufTemp);
-  postData += "\"direction: " + String(charBufTemp) + "º\" }, ";
-  dtostrf(pressureValue, 1, 2, charBufTemp);
-  postData += "{ \"title\": { \"text\": \"" + String(charBufTemp) + " mbar\", \"highlight\": true }, \"description\": \"Pressure\" } ";
-  postData += "] }";
+  dtostrf(windSpeedValue, 1, 1, charBufTemp1);
+  dtostrf(windDirectionValue, 1, 0, charBufTemp2);
+  dtostrf(pressureValue, 1, 2, charBufTemp3);
 
+  sprintf(postData, "{\"api_key\":\"%s\",\"data\":["
+    "{\"title\":{\"text\":\"Wind: %s m/s\",\"highlight\":true},\"description\":\"direction: %sº\"},"
+    "{\"title\":{\"text\":\"%s mbar\",\"highlight\":true},\"description\":\"Pressure\"}"
+    "]}", GECKOBOARD_APIKEY, charBufTemp1, charBufTemp2, charBufTemp3);
+  
+  Serial.flush(); // make sure the buffer is empty
   makePostRequest(Serial, GECKOBOARD_HOST, GECKOBOARD_URL_WINDPRESSURE, postData);
 }
 
 void sendLightData (float lightValue) {
-  String postData;
-
-  postData = "{ \"api_key\": \"" + String(GECKOBOARD_APIKEY) + "\", \"data\": ";
-  dtostrf(lightValue, 1, 1, charBufTemp);
-  postData += "{ \"item\" : \"" + String(charBufTemp) + "\", \"min\" : { \"text\" : \"Min\", \"value\" : \"0\" }, \"max\" : { \"text\" : \"Max\", \"value\" : \"100\" } } ";
-  postData += "}";
-
+  char postData[165];
+  
+  dtostrf(lightValue, 1, 1, charBufTemp1);
+  
+  sprintf(postData, "{\"api_key\":\"%s\",\"data\":"
+    "{\"item\":\"%s\",\"min\":{\"text\":\"Min\",\"value\":\"0\"},\"max\":{\"text\":\"Max\",\"value\":\"100\"}}"
+    "}", GECKOBOARD_APIKEY, charBufTemp1);
+  
+  Serial.flush(); // make sure the buffer is empty
   makePostRequest(Serial, GECKOBOARD_HOST, GECKOBOARD_URL_LIGHT, postData);  
 }
 
 void sendRainfallData (float rainfallValue) {
-  String postData;
 
-  postData = "{ \"api_key\": \"" + String(GECKOBOARD_APIKEY) + "\", \"data\": ";
-  dtostrf(rainfallValue, 1, 1, charBufTemp);
-  postData += "{ \"orientation\": \"horizontal\", \"item\": { \"label\": \"Last Hour (-- mm)\", \"sublabel\": \"(mm)\", \"axis\": { \"point\": [ \"0\", \"10\", \"20\", \"30\", \"40\", \"50\" ] }, \"range\":[ { \"color\": \"green\", \"start\": 0, \"end\": 2.5 }, { \"color\": \"amber\", \"start\": 2.6, \"end\": 10 }, { \"color\": \"red\", \"start\": 11, \"end\": 50 } ], \"measure\": { \"current\": { \"start\": \"0\", \"end\": \"" + String(charBufTemp) + "\" }, \"projected\": { \"start\": \"0\", \"end\": \"0\" } } } } ";
-  postData += "}";
+  dtostrf(rainfallValue, 1, 0, charBufTemp1);
 
-  makePostRequest(Serial, GECKOBOARD_HOST, GECKOBOARD_URL_RAINFALL, postData);
+  Serial.write('\0');   // INIT MESSAGE
+
+  Serial.print(F("POST ")); Serial.print(GECKOBOARD_URL_RAINFALL); 
+  Serial.print(F(" HTTP/1.1\r\nHost: ")); Serial.print(GECKOBOARD_HOST); 
+  Serial.print(F("\r\nUser-Agent: Arduino/1.0\r\nConnection: close\r\nContent-Length: "));
+  Serial.print((333 + strlen(charBufTemp1) + strlen(charBufTemp1))); // base length + rainfall value printed
+  Serial.print(F("\r\n\r\n"));
+
+  Serial.print(F("{\"api_key\":\""));
+  Serial.print(GECKOBOARD_APIKEY);
+  Serial.print(F("\",\"data\":{\"orientation\":\"horizontal\",\"item\":{\"label\":\"Last Hour ("));
+  Serial.print(charBufTemp1);
+  Serial.print(F(" mm)\",\"axis\":{\"point\":[\"0\",\"10\",\"20\",\"30\",\"40\",\"50\"]},\"range\":[{\"color\":\"green\",\"start\":0,\"end\":2.5},{\"color\":\"amber\",\"start\":2.6,\"end\":10},{\"color\":\"red\",\"start\":11,\"end\":50}],\"measure\":{\"current\":{\"start\":\"0\",\"end\":\""));
+  Serial.print(charBufTemp1);
+  Serial.print(F("\"}}}}}"));
+  Serial.flush();
+  
+  Serial.write('\0');   // END MESSAGE
+  Serial.flush();
+
 }
 
-void sendTemperatureHumidityData (float temperatureValue, float humidityValue) {
-  String postData;
+void sendTemperatureHumidityData (float temperatureValue, float* temperatureHistory, float humidityValue, float* humidityHistory) {
 
-  postData = "{ \"api_key\": \"" + String(GECKOBOARD_APIKEY) + "\", \"data\": ";
-  postData += "{ \"highchart\": { \"chart\": { \"renderTo\": \"container\", \"plotBackgroundColor\": \"rgba(35,37,38,0)\", \"backgroundColor\": \"rgba(35,37,38,0)\", \"borderColor\": \"rgba(35,37,38,0)\", \"lineColor\": \"rgba(35,37,38,0)\", \"plotBorderColor\": \"rgba(35,37,38,0)\", \"plotBorderWidth\": null, \"plotShadow\": false, \"zoomType\": \"xy\"}, \"title\": { \"text\": null },\"credits\": { \"enabled\": false }, \"xAxis\": [{\"categories\": [\"-11h\", \"-10h\", \"-9h\", \"-8h\", \"-7h\", \"-6h\", \"-5h\", \"-4h\", \"-3h\", \"-2h\", \"-1h\", \"now\"],\"labels\": {\"y\": 20,\"rotation\": -45},\"tickmarkPlacement\": \"on\",\"tickLength\": 3}],\"yAxis\": [{ \"labels\": {\"format\": \"{value}\",\"style\": {\"color\": \"#89A54E\"}},\"title\": {\"text\": \"Temperature (°C)\",\"style\": {\"color\": \"#89A54E\"}}}, { \"title\": {\"text\": \"Humidity (%)\",\"style\": {\"color\": \"#4572A7\"}},\"labels\": {\"format\": \"{value}\",\"style\": {\"color\": \"#4572A7\"}},\"opposite\": true}],\"tooltip\": {\"shared\": true,\"backgroundColor\": {\"linearGradient\": { \"x1\": 0, \"y1\": 0, \"x2\": 0, \"y2\": 1 },\"stops\": [[0, \"rgba(96, 96, 96, .8)\"],[1, \"rgba(16, 16, 16, .8)\"]]},\"borderWidth\": 0,\"style\": {\"color\": \"#FFF\"}},\"legend\": {\"enabled\": false},\"series\": [";
-  dtostrf(temperatureValue, 1, 1, charBufTemp);
-  postData += "{\"name\": \"Temperature\",\"color\": \"#89A54E\",\"type\": \"spline\",\"data\": [\"\", \"\", \"\", \"\", \"\", \"\", \"\", \"\", \"\", \"\", \"\", " + String(charBufTemp) + "],\"tooltip\": {\"valueSuffix\": \" °C\"}},";
-  dtostrf(humidityValue, 1, 1, charBufTemp);
-  postData += "{\"name\": \"Humidity\",\"color\": \"#4572A7\",\"type\": \"spline\",\"yAxis\": 1,\"data\": [\"\", \"\", \"\", \"\", \"\", \"\", \"\", \"\", \"\", \"\", \"\", " + String(charBufTemp) + "],\"tooltip\": {\"valueSuffix\": \" %\"}}";
-  postData += "]}}";
-  postData += "}";
+  char temperature_history_buffer[100];
+  char humidity_history_buffer[100];
 
-  makePostRequest(Serial, GECKOBOARD_HOST, GECKOBOARD_URL_TEMPERATUREHUMIDITY, postData);
+
+  temperature_history_buffer[0] = '\0';
+  humidity_history_buffer[0] = '\0';
+  
+  for(int i = (METRICS_HISTORY_SIZE - 1); i > 0; i--){
+    dtostrf(temperatureHistory[i], 1, 1, temperature_history_buffer + strlen(temperature_history_buffer));
+    strcpy(temperature_history_buffer + strlen(temperature_history_buffer), ",");
+  }
+  dtostrf(temperatureValue, 1, 1, temperature_history_buffer + strlen(temperature_history_buffer));
+
+  for(int i = (METRICS_HISTORY_SIZE - 1); i > 0; i--){
+    dtostrf(humidityHistory[i], 1, 1, humidity_history_buffer + strlen(humidity_history_buffer));
+    strcpy(humidity_history_buffer + strlen(humidity_history_buffer), ",");
+  }
+  dtostrf(humidityValue, 1, 1, humidity_history_buffer + strlen(humidity_history_buffer));
+  
+
+  Serial.write('\0');   // INIT MESSAGE
+
+  Serial.print(F("POST ")); Serial.print(GECKOBOARD_URL_TEMPERATUREHUMIDITY); 
+  Serial.print(F(" HTTP/1.1\r\nHost: ")); Serial.print(GECKOBOARD_HOST); 
+  Serial.print(F("\r\nUser-Agent: Arduino/1.0\r\nConnection: close\r\nContent-Length: "));
+  Serial.print((961 + strlen(temperature_history_buffer) + strlen(humidity_history_buffer))); // base length + temperature and humidity values printed
+  Serial.print(F("\r\n\r\n"));
+
+  Serial.print(F("{\"api_key\":\""));
+  Serial.print(GECKOBOARD_APIKEY);
+  Serial.print(F("\",\"data\":{\"highchart\":{\"chart\":{\"renderTo\":\"container\",\"plotBackgroundColor\":\"rgba(35,37,38,0)\",\"backgroundColor\":\"rgba(35,37,38,0)\",\"borderColor\":\"rgba(35,37,38,0)\",\"lineColor\":\"rgba(35,37,38,0)\",\"plotBorderColor\":\"rgba(35,37,38,0)\",\"plotBorderWidth\":null,\"plotShadow\":false,\"alignTicks\":false},\"title\":{\"text\":null},\"credits\":{\"enabled\":false},\"xAxis\":[{\"categories\":[\"-11h\",\"-10h\",\"-9h\",\"-8h\",\"-7h\",\"-6h\",\"-5h\",\"-4h\",\"-3h\",\"-2h\",\"-1h\",\"now\"],\"labels\":{\"y\":20,\"rotation\":-45},\"tickmarkPlacement\":\"on\",\"tickLength\":3}],\"yAxis\":[{\"title\":{\"text\":\"Temperature (°C)\",\"style\":{\"color\":\"#89A54E\"}},\"min\":0,\"max\":30},{\"title\":{\"text\":\"Humidity (%)\",\"style\":{\"color\":\"#4572A7\"}},\"opposite\":true,\"min\":0,\"max\":100}],\"tooltip\":{\"shared\":true},\"legend\":{\"enabled\":false},\"series\":[{\"name\":\"Temperature\",\"color\":\"#89A54E\",\"type\":\"spline\",\"data\":["));
+  Serial.print(temperature_history_buffer);
+  Serial.print(F("]},{\"name\":\"Humidity\",\"color\":\"#4572A7\",\"type\":\"spline\",\"yAxis\":1,\"data\":["));
+  Serial.print(humidity_history_buffer);
+  Serial.print(F("]}]}}}"));
+  Serial.flush();
+  
+  Serial.write('\0');   // END MESSAGE
+  Serial.flush();
+
 }
 
 
